@@ -16,6 +16,7 @@
 
 #include <SurfaceFlingerProperties.sysprop.h>
 #include <android-base/stringprintf.h>
+#include <common/FlagManager.h>
 #include <compositionengine/CompositionEngine.h>
 #include <compositionengine/CompositionRefreshArgs.h>
 #include <compositionengine/DisplayColorProfile.h>
@@ -463,6 +464,10 @@ ftl::Future<std::monostate> Output::present(
     setColorTransform(refreshArgs);
     beginFrame();
 
+    if (isPowerHintSessionEnabled()) {
+        // always reset the flag before the composition prediction
+        setHintSessionRequiresRenderEngine(false);
+    }
     GpuCompositionResult result;
     const bool predictCompositionStrategy = canPredictCompositionStrategy(refreshArgs);
     if (predictCompositionStrategy) {
@@ -818,44 +823,6 @@ void Output::updateCompositionState(const compositionengine::CompositionRefreshA
         if (mLayerRequestingBackgroundBlur == layer) {
             forceClientComposition = false;
         }
-    }
-
-    updateCompositionStateForBorder(refreshArgs);
-}
-
-void Output::updateCompositionStateForBorder(
-        const compositionengine::CompositionRefreshArgs& refreshArgs) {
-    std::unordered_map<int32_t, const Region*> layerVisibleRegionMap;
-    // Store a map of layerId to their computed visible region.
-    for (auto* layer : getOutputLayersOrderedByZ()) {
-        int layerId = (layer->getLayerFE()).getSequence();
-        layerVisibleRegionMap[layerId] = &((layer->getState()).visibleRegion);
-    }
-    OutputCompositionState& outputCompositionState = editState();
-    outputCompositionState.borderInfoList.clear();
-    bool clientComposeTopLayer = false;
-    for (const auto& borderInfo : refreshArgs.borderInfoList) {
-        renderengine::BorderRenderInfo info;
-        for (const auto& id : borderInfo.layerIds) {
-            info.combinedRegion.orSelf(*(layerVisibleRegionMap[id]));
-        }
-
-        if (!info.combinedRegion.isEmpty()) {
-            info.width = borderInfo.width;
-            info.color = borderInfo.color;
-            outputCompositionState.borderInfoList.emplace_back(std::move(info));
-            clientComposeTopLayer = true;
-        }
-    }
-
-    // In this situation we must client compose the top layer instead of using hwc
-    // because we want to draw the border above all else.
-    // This could potentially cause a bit of a performance regression if the top
-    // layer would have been rendered using hwc originally.
-    // TODO(b/227656283): Measure system's performance before enabling the border feature
-    if (clientComposeTopLayer) {
-        auto topLayer = getOutputLayerOrderedByZByIndex(getOutputLayerCount() - 1);
-        (topLayer->editState()).forceClientComposition = true;
     }
 }
 
@@ -1249,8 +1216,7 @@ void Output::finishFrame(GpuCompositionResult&& result) {
     if (!optReadyFence) {
         return;
     }
-
-    if (isPowerHintSessionEnabled()) {
+    if (isPowerHintSessionEnabled() && !isPowerHintSessionGpuReportingEnabled()) {
         // get fence end time to know when gpu is complete in display
         setHintSessionGpuFence(
                 std::make_unique<FenceTime>(sp<Fence>::make(dup(optReadyFence->get()))));
@@ -1394,8 +1360,20 @@ std::optional<base::unique_fd> Output::composeSurfaces(
         // If rendering was not successful, remove the request from the cache.
         mClientCompositionRequestCache->remove(tex->getBuffer()->getId());
     }
-
     const auto fence = std::move(fenceResult).value_or(Fence::NO_FENCE);
+    if (isPowerHintSessionEnabled()) {
+        if (fence != Fence::NO_FENCE && fence->isValid() &&
+            !outputCompositionState.reusedClientComposition) {
+            setHintSessionRequiresRenderEngine(true);
+            if (isPowerHintSessionGpuReportingEnabled()) {
+                // the order of the two calls here matters as we should check if the previously
+                // tracked fence has signaled first and archive the previous start time
+                setHintSessionGpuStart(TimePoint::now());
+                setHintSessionGpuFence(
+                        std::make_unique<FenceTime>(sp<Fence>::make(dup(fence->get()))));
+            }
+        }
+    }
 
     if (auto timeStats = getCompositionEngine().getTimeStats()) {
         if (fence->isValid()) {
@@ -1445,13 +1423,6 @@ renderengine::DisplaySettings Output::generateClientCompositionDisplaySettings(
 
     // Compute the global color transform matrix.
     clientCompositionDisplay.colorTransform = outputState.colorTransformMatrix;
-    for (auto& info : outputState.borderInfoList) {
-        renderengine::BorderRenderInfo borderInfo;
-        borderInfo.width = info.width;
-        borderInfo.color = info.color;
-        borderInfo.combinedRegion = info.combinedRegion;
-        clientCompositionDisplay.borderInfoList.emplace_back(std::move(borderInfo));
-    }
     clientCompositionDisplay.deviceHandlesColorTransform =
             outputState.usesDeviceComposition || getSkipColorTransform();
     return clientCompositionDisplay;
@@ -1578,11 +1549,23 @@ void Output::setExpensiveRenderingExpected(bool) {
     // The base class does nothing with this call.
 }
 
+void Output::setHintSessionGpuStart(TimePoint) {
+    // The base class does nothing with this call.
+}
+
 void Output::setHintSessionGpuFence(std::unique_ptr<FenceTime>&&) {
     // The base class does nothing with this call.
 }
 
+void Output::setHintSessionRequiresRenderEngine(bool) {
+    // The base class does nothing with this call.
+}
+
 bool Output::isPowerHintSessionEnabled() {
+    return false;
+}
+
+bool Output::isPowerHintSessionGpuReportingEnabled() {
     return false;
 }
 
@@ -1628,9 +1611,13 @@ void Output::presentFrameAndReleaseLayers(bool flushEvenWhenDisabled) {
             releaseFence =
                     Fence::merge("LayerRelease", releaseFence, frame.clientTargetAcquireFence);
         }
-        layer->getLayerFE()
-                .onLayerDisplayed(ftl::yield<FenceResult>(std::move(releaseFence)).share(),
-                                  outputState.layerFilter.layerStack);
+        if (FlagManager::getInstance().ce_fence_promise()) {
+            layer->getLayerFE().setReleaseFence(releaseFence);
+        } else {
+            layer->getLayerFE()
+                    .onLayerDisplayed(ftl::yield<FenceResult>(std::move(releaseFence)).share(),
+                                      outputState.layerFilter.layerStack);
+        }
     }
 
     // We've got a list of layers needing fences, that are disjoint with
@@ -1638,8 +1625,12 @@ void Output::presentFrameAndReleaseLayers(bool flushEvenWhenDisabled) {
     // supply them with the present fence.
     for (auto& weakLayer : mReleasedLayers) {
         if (const auto layer = weakLayer.promote()) {
-            layer->onLayerDisplayed(ftl::yield<FenceResult>(frame.presentFence).share(),
-                                    outputState.layerFilter.layerStack);
+            if (FlagManager::getInstance().ce_fence_promise()) {
+                layer->setReleaseFence(frame.presentFence);
+            } else {
+                layer->onLayerDisplayed(ftl::yield<FenceResult>(frame.presentFence).share(),
+                                        outputState.layerFilter.layerStack);
+            }
         }
     }
 

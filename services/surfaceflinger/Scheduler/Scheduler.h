@@ -92,8 +92,8 @@ public:
 
     void startTimers();
 
-    // TODO(b/241285191): Remove this API by promoting pacesetter in onScreen{Acquired,Released}.
-    void setPacesetterDisplay(std::optional<PhysicalDisplayId>) REQUIRES(kMainThreadContext)
+    // TODO: b/241285191 - Remove this API by promoting pacesetter in onScreen{Acquired,Released}.
+    void setPacesetterDisplay(PhysicalDisplayId) REQUIRES(kMainThreadContext)
             EXCLUDES(mDisplayLock);
 
     using RefreshRateSelectorPtr = std::shared_ptr<RefreshRateSelector>;
@@ -195,7 +195,7 @@ public:
     const VsyncConfiguration& getVsyncConfiguration() const { return *mVsyncConfiguration; }
 
     // Sets the render rate for the scheduler to run at.
-    void setRenderRate(PhysicalDisplayId, Fps);
+    void setRenderRate(PhysicalDisplayId, Fps, bool applyImmediately);
 
     void enableHardwareVsync(PhysicalDisplayId) REQUIRES(kMainThreadContext);
     void disableHardwareVsync(PhysicalDisplayId, bool disallow) REQUIRES(kMainThreadContext);
@@ -353,7 +353,9 @@ private:
     // Used to skip event dispatch before EventThread creation during boot.
     // TODO: b/241285191 - Reorder Scheduler initialization to avoid this.
     bool hasEventThreads() const {
-        return CC_LIKELY(mRenderEventThread && mLastCompositeEventThread);
+        return CC_LIKELY(
+                mRenderEventThread &&
+                (FlagManager::getInstance().deprecate_vsync_sf() || mLastCompositeEventThread));
     }
 
     EventThread& eventThreadFor(Cycle cycle) const {
@@ -375,9 +377,16 @@ private:
     void resyncAllToHardwareVsync(bool allowToEnable) EXCLUDES(mDisplayLock);
     void setVsyncConfig(const VsyncConfig&, Period vsyncPeriod);
 
-    // Chooses a pacesetter among the registered displays, unless `pacesetterIdOpt` is specified.
-    // The new `mPacesetterDisplayId` is never `std::nullopt`.
-    void promotePacesetterDisplay(std::optional<PhysicalDisplayId> pacesetterIdOpt = std::nullopt)
+    // TODO: b/241286431 - Remove this option, which assumes that the pacesetter does not change
+    // when a (secondary) display is registered or unregistered. In the short term, this avoids
+    // a deadlock where the main thread joins with the timer thread as the timer thread waits to
+    // lock a mutex held by the main thread.
+    struct PromotionParams {
+        // Whether to stop and start the idle timer. Ignored unless connected_display flag is set.
+        bool toggleIdleTimer;
+    };
+
+    void promotePacesetterDisplay(PhysicalDisplayId pacesetterId, PromotionParams)
             REQUIRES(kMainThreadContext) EXCLUDES(mDisplayLock);
 
     // Changes to the displays (e.g. registering and unregistering) must be made
@@ -386,14 +395,16 @@ private:
     // MessageQueue and EventThread need to use the new pacesetter's
     // VsyncSchedule, and this must happen while mDisplayLock is *not* locked,
     // or else we may deadlock with EventThread.
-    std::shared_ptr<VsyncSchedule> promotePacesetterDisplayLocked(
-            std::optional<PhysicalDisplayId> pacesetterIdOpt = std::nullopt)
+    std::shared_ptr<VsyncSchedule> promotePacesetterDisplayLocked(PhysicalDisplayId pacesetterId,
+                                                                  PromotionParams)
             REQUIRES(kMainThreadContext, mDisplayLock);
     void applyNewVsyncSchedule(std::shared_ptr<VsyncSchedule>) EXCLUDES(mDisplayLock);
 
-    // Blocks until the pacesetter's idle timer thread exits. `mDisplayLock` must not be locked by
-    // the caller on the main thread to avoid deadlock, since the timer thread locks it before exit.
-    void demotePacesetterDisplay() REQUIRES(kMainThreadContext) EXCLUDES(mDisplayLock, mPolicyLock);
+    // If toggleIdleTimer is true, the calling thread blocks until the pacesetter's idle timer
+    // thread exits, in which case mDisplayLock must not be locked by the caller to avoid deadlock,
+    // since the timer thread locks it before exit.
+    void demotePacesetterDisplay(PromotionParams) REQUIRES(kMainThreadContext)
+            EXCLUDES(mDisplayLock, mPolicyLock);
 
     void registerDisplayInternal(PhysicalDisplayId, RefreshRateSelectorPtr, VsyncSchedulePtr,
                                  PhysicalDisplayId activeDisplayId) REQUIRES(kMainThreadContext)
